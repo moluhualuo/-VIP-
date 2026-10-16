@@ -108,6 +108,7 @@ class App(ttk.Frame):
         self.partial_ts: str | None = None
         self._preview_ready = False
         self.pending_finish = False
+        self._log_lines = 0
 
     # ---------------- layout ----------------
 
@@ -329,6 +330,16 @@ class App(ttk.Frame):
         ts = time.strftime("%H:%M:%S")
         self.txt.insert("end", f"[{ts}] {line}\n")
         self.txt.see("end")
+        self._log_lines += 1
+        # Batch-trim: only touch the widget when it has grown well past the
+        # cap, and delete a whole block at once. Trimming on every tick (and
+        # toggling state while doing it) was both slow and buggy.
+        if self._log_lines > 400:
+            try:
+                self.txt.delete("1.0", "201.0")
+                self._log_lines -= 200
+            except Exception:
+                pass
 
     # ---------------- run / stop ----------------
 
@@ -401,6 +412,10 @@ class App(ttk.Frame):
 
         self._append_log("=" * 46)
         self._append_log("开始新任务")
+        backend = core.aes_backend()
+        self._append_log(f"解密后端: {backend}"
+                         + ("（C 加速，正常）" if backend != "python"
+                            else "（纯 Python 回退，会非常慢！）"))
         self.start_time = time.time()
 
         self.worker = threading.Thread(target=self._run_worker,
@@ -436,7 +451,7 @@ class App(ttk.Frame):
         handle per tick, and (b) collapse segment/progress spam down to the
         latest state instead of setting Tk variables once per event.
         """
-        LOG_CAP = 200          # never let the log pane grow without bound
+        LOG_CAP = 200          # kept for reference; trimming is incremental
         handled = 0
         latest_segment = None  # only the newest one matters for the display
 
@@ -487,14 +502,7 @@ class App(ttk.Frame):
                 self.var_status.set("完成")
 
         # Trim the log so a long run cannot slow every redraw down.
-        try:
-            lines = int(self.txt.index("end-1c").split(".")[0])
-            if lines > LOG_CAP:
-                self.txt.configure(state="normal")
-                self.txt.delete("1.0", f"{lines - LOG_CAP}.0")
-                self.txt.configure(state="disabled")
-        except Exception:
-            pass
+        # (Handled incrementally in _append_log; nothing to do per tick.)
 
         self.master.after(150, self._poll_queue)
 
@@ -569,6 +577,13 @@ def human_time(sec: float) -> str:
 
 
 def main():
+    # Hidden self-test: `VideosHubDownloader.exe --selftest [segments] [workers]`
+    # Runs a download with a UI-thread heartbeat and prints freeze statistics.
+    # Used to measure responsiveness inside the frozen environment.
+    if "--selftest" in sys.argv:
+        _selftest()
+        return
+
     root = tk.Tk()
     root.title(f"{APP_TITLE} v{VERSION}")
     root.geometry("760x680")
@@ -579,6 +594,105 @@ def main():
         pass
     App(root)
     root.mainloop()
+
+
+def _selftest():
+    """UI-thread heartbeat while a real download runs. Writes a report file.
+
+    The report is written incrementally so that even a killed run leaves data
+    behind. Each stall is tagged with the status text that was on screen at
+    the time, which tells us *which phase* froze the UI.
+    """
+    args = [a for a in sys.argv[1:] if a != "--selftest" and not a.startswith("--")]
+    max_seg = int(args[0]) if args else 150
+    workers = args[1] if len(args) > 1 else "8"
+    base = (os.path.dirname(sys.executable)
+            if getattr(sys, "frozen", False) else os.getcwd())
+    report = os.path.join(base, "_selftest_report.txt")
+
+    root = tk.Tk()
+    # Visible window: repaint cost only shows up when Tk actually has to
+    # redraw. Withdrawing the window would hide the very problem we measure.
+    if "--hidden" in sys.argv:
+        root.withdraw()
+    else:
+        root.geometry("760x680")
+        root.deiconify()
+    app = App(root)
+    app.var_mode.set("random")
+    app.var_quality.set("1080p")
+    app.var_max_seg.set(str(max_seg))
+    app.var_workers.set(workers)
+    app.var_outdir.set(os.path.join(base, "_selftest_out"))
+
+    samples = []          # (gap_ms, status_text_at_that_moment)
+    last = [0.0]
+    stop = threading.Event()
+
+    def write_report(final=False):
+        gaps = sorted(s[0] for s in samples)
+        n = len(gaps)
+        out = ["selftest: segments=%s workers=%s frozen=%s visible=%s" %
+               (max_seg, workers, getattr(sys, "frozen", False),
+                "--hidden" not in sys.argv),
+               "aes_backend=%s" % core.aes_backend(),
+               "samples=%d" % n]
+        if n:
+            out += [
+                "median=%.1fms" % gaps[n // 2],
+                "p90=%.1fms" % gaps[min(n - 1, int(n * 0.90))],
+                "p99=%.1fms" % gaps[min(n - 1, int(n * 0.99))],
+                "max=%.1fms" % gaps[-1],
+                "over150=%d" % len([g for g in gaps if g > 150]),
+                "over500=%d" % len([g for g in gaps if g > 500]),
+                "over2000=%d" % len([g for g in gaps if g > 2000]),
+            ]
+            worst = sorted(samples, key=lambda s: -s[0])[:8]
+            out.append("--- worst stalls (gap_ms @ status) ---")
+            for g, st in worst:
+                out.append("  %8.0f ms  @ %s" % (g, st))
+        text = "\n".join(out)
+        try:
+            with open(report, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
+        if final:
+            print(text)
+
+    def heartbeat():
+        now = time.perf_counter()
+        if last[0]:
+            gap = (now - last[0]) * 1000.0
+            try:
+                st = app.var_status.get()
+            except Exception:
+                st = "?"
+            samples.append((gap, st))
+        last[0] = now
+        if not stop.is_set():
+            root.after(50, heartbeat)
+
+    def watchdog():
+        start = time.time()
+        while time.time() - start < 420:
+            w = app.worker
+            if w is None or not w.is_alive():
+                time.sleep(0.3)
+                if app.worker is None or not app.worker.is_alive():
+                    break
+            # Keep a rolling report on disk so an abort still leaves evidence.
+            if int(time.time() - start) % 5 == 0:
+                write_report(final=False)
+            time.sleep(0.1)
+        stop.set()
+        root.after(500, root.destroy)
+
+    heartbeat()
+    app._start()
+    threading.Thread(target=watchdog, daemon=True).start()
+    root.mainloop()
+    write_report(final=True)
 
 
 if __name__ == "__main__":

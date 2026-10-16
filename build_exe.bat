@@ -17,7 +17,11 @@ echo [*] Building ...
   --name "VideosHubDownloader" ^
   --onefile --windowed ^
   --collect-all av ^
+  --collect-all Crypto ^
   --hidden-import av ^
+  --hidden-import Crypto ^
+  --hidden-import Crypto.Cipher ^
+  --hidden-import Crypto.Cipher.AES ^
   --hidden-import videoshub_core ^
   --hidden-import videoshub_player ^
   videoshub_gui.py

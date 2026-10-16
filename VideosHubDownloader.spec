@@ -3,8 +3,11 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['av', 'videoshub_core', 'videoshub_player']
+hiddenimports = ['av', 'videoshub_core', 'videoshub_player',
+                 'Crypto', 'Crypto.Cipher', 'Crypto.Cipher.AES']
 tmp_ret = collect_all('av')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('Crypto')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

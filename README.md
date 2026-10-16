@@ -58,17 +58,38 @@ tkinter 图形界面 + PyInstaller 打包的独立 exe。核心下载逻辑与�
 ## 从源码运行
 
 ```bash
-pip install av          # 可选：没有 ffmpeg 时用它转 MP4
+pip install av pycryptodome   # av 用于转 MP4；pycryptodome 是必须的加速项
 python videoshub_gui.py
 ```
 
 tkinter 是 Python 标准库,不需要额外安装。**注意需要带 tkinter 的 Python**
 (Windows 官方安装包默认带;某些精简版/嵌入式发行版可能没有)。
 
+## AES 解密后端(重要)
+
+HLS 分片是 AES-128-CBC 加密的,解密是整个程序最热的循环。程序按以下顺序挑后端:
+
+| 优先级 | 后端 | 说明 |
+|---|---|---|
+| 1 | **pycryptodome** | C 实现,**释放 GIL**,进程内调用。已打进 exe,正常情况永远走这条 |
+| 2 | openssl CLI | 速度尚可,但**每个分片都要新建一个进程**(实测比方案 1 慢 65 倍) |
+| 3 | 纯 Python | 兜底。**比方案 1 慢约 12700 倍** |
+
+> **为什么这件事很关键:** 纯 Python 的 AES 每解一个 676KB 分片要 **23 秒**,
+> 而且全程持有 GIL。8 个并发线程一起跑,不但没有提速,还会把界面线程饿死 ——
+> 表现为**窗口冻住好几秒、下载龟速**。
+>
+> 曾经踩过的坑:打包机上 Git Bash 的 PATH 里有 `openssl`,而**双击 exe 时用的是
+> Windows PATH,里面没有 openssl**,于是静默回退到纯 Python,界面直接卡死。
+> 现在 pycryptodome 被显式打进 exe,不再依赖 PATH,这个坑已经堵死。
+
+界面日志第一行会打印实际使用的后端(如 `解密后端: pycryptodome`),便于排查。
+如果看到 `python`,说明加速库缺失,此时程序会**自动把并发降到 1** 并给出警告。
+
 ## 重新打包 exe
 
 ```bash
-pip install pyinstaller av
+pip install pyinstaller av pycryptodome
 build_exe.bat
 ```
 
@@ -76,16 +97,20 @@ build_exe.bat
 
 ```bash
 python -m PyInstaller --noconfirm --clean --name "VideosHubDownloader" ^
-  --onefile --windowed --collect-all av ^
-  --hidden-import av --hidden-import videoshub_core videoshub_gui.py
+  --onefile --windowed --collect-all av --collect-all Crypto ^
+  --hidden-import av --hidden-import Crypto --hidden-import Crypto.Cipher ^
+  --hidden-import Crypto.Cipher.AES ^
+  --hidden-import videoshub_core videoshub_gui.py
 ```
 
-产物在 `dist\VideosHubDownloader.exe`(约 39 MB)。
+产物在 `dist\VideosHubDownloader.exe`(约 43 MB)。
 
 ### 打包要点
 
 - **`--collect-all av` 必须加**。PyAV 依赖一批 FFmpeg 原生 DLL,默认不会被自动收集,
   漏了的话 exe 能启动但一转 MP4 就报 `ImportError: DLL load failed`。
+- **`--collect-all Crypto` 也必须加**。pycryptodome 的 AES 是 C 扩展,漏了会静默
+  退回纯 Python,界面卡死且下载极慢(见上文)。
 - **`--windowed`** 用于去掉黑色控制台窗口。
 - **`--hidden-import videoshub_core`** 确保被 GUI 间接引用的核心模块被打进包里。
 - 打包机的 Python 必须带 tkinter(`pyi_rth__tkinter` 运行时钩子依赖它)。
@@ -103,6 +128,7 @@ python -m PyInstaller --noconfirm --clean --name "VideosHubDownloader" ^
 ## 已知边界
 
 - 不支持断点续传。中断后重跑会从第 1 个分片开始。
-- 748 分片的长片串行下载约 13 分钟(受网速限制),这是主要耗时。
+- 748 分片的长片,8 并发下约 2~3 分钟(受网速限制)。
 - 任务一次只能跑一个;运行中「开始下载」按钮会禁用。
 - 打包的是 64 位 Windows exe,且未做代码签名,首次运行可能触发 SmartScreen 提示。
+- `480p` 的签名 URL 服务端会返回 403,这是服务端行为,`720p`/`1080p` 正常。

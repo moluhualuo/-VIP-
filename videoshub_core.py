@@ -292,7 +292,31 @@ def fetch_bytes(url, referer=None, retries=3, should_stop=None):
     raise RuntimeError(f"failed to fetch {url} after {retries} attempts: {last}")
 
 
-# ---------------- AES-128-CBC (pure Python fallback) ----------------
+# ---------------- AES-128-CBC ----------------
+#
+# Three implementations exist and are tried in order of speed AND of how
+# kindly they treat the GIL. The pure-Python one below is correct but ~100x
+# slower than C and, because it is pure bytecode, it holds the GIL for the
+# whole decryption. Running several of those in threads starves the GUI.
+#
+#   pycryptodome (C, releases the GIL, in-process)  <- preferred, bundled
+#   openssl CLI  (C, but forks a process per segment)
+#   pure Python  (last resort)
+try:
+    from Crypto.Cipher import AES as _AES
+except Exception:                                    # pragma: no cover
+    _AES = None
+
+
+def _strip_pkcs7(data: bytes) -> bytes:
+    """Remove PKCS#7 padding, tolerating data that is not padded."""
+    if not data:
+        return data
+    pad = data[-1]
+    if 1 <= pad <= 16 and data[-pad:] == bytes([pad]) * pad:
+        return data[:-pad]
+    return data
+
 
 _SBOX = [
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
@@ -397,6 +421,25 @@ def _aes128_cbc_decrypt_py(key: bytes, iv: bytes, data: bytes) -> bytes:
 
 
 def aes128_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Decrypt one AES-128-CBC segment (PKCS#7 padding removed).
+
+    Backend order matters a lot here. Decrypting segments is the hot loop, and
+    with several worker threads a GIL-hugging implementation does not merely
+    run slowly -- it starves the GUI thread and the window freezes for seconds.
+    So we prefer, in order:
+
+      1. pycryptodome -- C code that releases the GIL, runs in-process
+         (no process spawn per segment). This is what ships in the exe.
+      2. the openssl CLI -- fast crypto, but forks a process per segment.
+      3. pure Python -- correct but ~100x slower and GIL-bound. Last resort.
+    """
+    if _AES is not None:
+        try:
+            dec = _AES.new(key, _AES.MODE_CBC, iv).decrypt(data)
+            return _strip_pkcs7(dec)
+        except Exception:
+            pass
+
     exe = shutil.which("openssl")
     if exe:
         try:
@@ -409,6 +452,15 @@ def aes128_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
         except Exception:
             pass
     return _aes128_cbc_decrypt_py(key, iv, data)
+
+
+def aes_backend() -> str:
+    """Name of the backend aes128_cbc_decrypt() will use, for diagnostics."""
+    if _AES is not None:
+        return "pycryptodome"
+    if shutil.which("openssl"):
+        return "openssl"
+    return "python"
 
 
 # ---------------- playlist ----------------
@@ -534,6 +586,15 @@ def download_and_merge(full_url, outdir, out_name="output", max_segments=0,
     """
     stop = should_stop or (lambda: False)
     workers = max(1, int(workers))
+
+    # Safety net: pure-Python AES is ~10000x slower and holds the GIL for the
+    # entire decrypt. Running several of those in parallel does not speed
+    # anything up, it just starves the GUI thread, so we serialise instead.
+    if aes_backend() == "python" and workers > 1:
+        progress.log("WARNING: no C AES backend found (pycryptodome/openssl "
+                     "missing). Falling back to pure Python, which is very "
+                     "slow -- forcing 1 connection.")
+        workers = 1
 
     progress.stage("playlist")
     playlist = fetch_bytes(full_url, should_stop=stop).decode("utf-8", "replace")
