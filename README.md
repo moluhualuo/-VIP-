@@ -6,13 +6,32 @@ tkinter 图形界面 + PyInstaller 打包的独立 exe。核心下载逻辑与�
 
 | 文件 | 作用 |
 |---|---|
-| `dist/VideosHubDownloader.exe` | **最终交付物**,双击即用,无需安装 Python |
+| `dist/VideosHubDownloader.exe` | **最终交付物**,双击即用,无需安装 Python(不入库,见下) |
 | `videoshub_gui.py` | 图形界面(tkinter) |
 | `videoshub_core.py` | 核心下载逻辑,与界面解耦,可单独 import 使用 |
 | `videoshub_player.py` | 播放器探测与调用 |
-| `videoshub_watch.py` | 最初的命令行版本,保留作参考 |
+| `legacy/videoshub_watch.py` | 最初的命令行版本,保留作参考 |
 | `VideosHubDownloader.spec` | PyInstaller 打包配置 |
 | `build_exe.bat` | 一键重新打包脚本 |
+
+> **关于 exe**:`dist/` 已被 `.gitignore` 排除。exe 约 43MB,如果每次重打包都提交,
+> 仓库会迅速膨胀(之前 `.git` 一度涨到 153MB)。请改用 **GitHub Releases** 分发二进制。
+
+### 目录结构
+
+```
+lldx/
+├── README.md                    说明文档
+├── videoshub_gui.py             界面入口
+├── videoshub_core.py            核心逻辑
+├── videoshub_player.py          播放器调用
+├── build_exe.bat                一键打包
+├── VideosHubDownloader.spec     PyInstaller 配置
+├── legacy/
+│   └── videoshub_watch.py       最初的 CLI 版(仅参考)
+└── dist/                        打包产物(不入库)
+    └── VideosHubDownloader.exe
+```
 
 ## 直接使用
 
