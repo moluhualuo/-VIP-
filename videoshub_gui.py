@@ -37,7 +37,15 @@ def _resource_dir() -> str:
 
 
 class QueueProgress(core.Progress):
-    """Marshals worker-thread events onto the UI thread via a queue."""
+    """Marshals worker-thread events onto the UI thread via a queue.
+
+    Segment events are throttled at the source: with 8 parallel workers the
+    raw rate would flood the UI thread and make the window unresponsive.
+    The progress bar only ever needs the latest value, so we drop the rest.
+    """
+
+    # Emit at most one segment event per this many segments, plus the last one.
+    SEGMENT_STRIDE = 4
 
     def __init__(self, q: "queue.Queue"):
         self.q = q
@@ -49,6 +57,8 @@ class QueueProgress(core.Progress):
         self.q.put(("stage", name))
 
     def segment(self, done, total, name, enc, dec) -> None:
+        if done % self.SEGMENT_STRIDE and done != total:
+            return
         self.q.put(("segment", (done, total, name, enc, dec)))
 
     def finish(self, path: str) -> None:
@@ -96,6 +106,8 @@ class App(ttk.Frame):
         self.var_player = tk.StringVar(value="系统默认播放器")
         # Path of the in-progress .ts, so the preview button knows what to open.
         self.partial_ts: str | None = None
+        self._preview_ready = False
+        self.pending_finish = False
 
     # ---------------- layout ----------------
 
@@ -239,11 +251,13 @@ class App(ttk.Frame):
         self.rowconfigure(row, weight=1)
         row += 1
 
-        self.txt = tk.Text(box_log, height=14, wrap="none", state="disabled",
+        self.txt = tk.Text(box_log, height=14, wrap="none", state="normal",
                            background="#1e1e1e", foreground="#d4d4d4",
                            insertbackground="#d4d4d4", relief="flat",
                            font=("Consolas", 9))
         self.txt.grid(row=0, column=0, sticky="nsew")
+        # Read-only in effect: block typing/editing but avoid state toggling.
+        self.txt.bind("<Key>", lambda e: "break")
         vs = ttk.Scrollbar(box_log, orient="vertical", command=self.txt.yview)
         vs.grid(row=0, column=1, sticky="ns")
         self.txt.configure(yscrollcommand=vs.set)
@@ -306,11 +320,15 @@ class App(ttk.Frame):
     # ---------------- logging ----------------
 
     def _append_log(self, line: str):
+        """Append one line. Cheap enough to call in bursts.
+
+        We keep the widget in its normal state and rely on the scrollback trim
+        in _poll_queue to bound growth; toggling state per line was the
+        expensive part.
+        """
         ts = time.strftime("%H:%M:%S")
-        self.txt.configure(state="normal")
         self.txt.insert("end", f"[{ts}] {line}\n")
         self.txt.see("end")
-        self.txt.configure(state="disabled")
 
     # ---------------- run / stop ----------------
 
@@ -372,6 +390,8 @@ class App(ttk.Frame):
         self.cancel_event.clear()
         self.last_result = None
         self.partial_ts = None
+        self._preview_ready = False
+        self.pending_finish = False
         self.var_progress.set(0.0)
         self.var_status.set("准备中...")
         self.btn_start.configure(state="disabled")
@@ -409,29 +429,41 @@ class App(ttk.Frame):
     # ---------------- queue pump ----------------
 
     def _poll_queue(self):
+        """Drain worker events, but cheaply.
+
+        With N parallel downloads the worker can enqueue segment events far
+        faster than the UI should repaint. So we (a) cap how many events we
+        handle per tick, and (b) collapse segment/progress spam down to the
+        latest state instead of setting Tk variables once per event.
+        """
+        LOG_CAP = 200          # never let the log pane grow without bound
+        handled = 0
+        latest_segment = None  # only the newest one matters for the display
+
         try:
-            while True:
-                kind, payload = self.q.get_nowait()
+            while handled < 300:
+                try:
+                    kind, payload = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                handled += 1
+
                 if kind == "log":
                     self._append_log(payload)
                 elif kind == "stage":
                     self.var_status.set(f"阶段: {STAGE_LABELS.get(payload, payload)}")
                 elif kind == "segment":
-                    done, total, name, enc, dec = payload
-                    self.var_progress.set(done * 100.0 / max(total, 1))
-                    self.var_status.set(f"下载分片 {done}/{total}  {name}")
-                    if done % 20 == 0 or done == total:
-                        self._append_log(
-                            f"[+] {done}/{total} {name} ({enc} -> {dec} bytes)")
-                elif kind == "finish":
-                    self.var_progress.set(100.0)
-                    self.var_status.set("完成")
+                    # Coalesce: keep only the newest, apply after the loop.
+                    latest_segment = payload
                 elif kind == "partial":
                     path, done, total = payload
                     self.partial_ts = path
-                    # Only offer the preview once something is actually on disk.
-                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                    if not self._preview_ready and os.path.exists(path) \
+                            and os.path.getsize(path) > 0:
+                        self._preview_ready = True
                         self.btn_preview.configure(state="normal")
+                elif kind == "finish":
+                    self.pending_finish = True
                 elif kind == "done":
                     self._on_done(payload)
                 elif kind == "cancelled":
@@ -441,7 +473,30 @@ class App(ttk.Frame):
         except queue.Empty:
             pass
         finally:
-            self.master.after(120, self._poll_queue)
+            # Apply the coalesced progress exactly once per tick.
+            if latest_segment is not None:
+                done, total, name, enc, dec = latest_segment
+                self.var_progress.set(done * 100.0 / max(total, 1))
+                self.var_status.set(f"下载分片 {done}/{total}")
+                # Short label only — the segment name is a huge signed URL.
+                if done % 40 == 0 or done == total:
+                    self._append_log(f"[+] {done}/{total} ({enc} -> {dec} bytes)")
+            if self.pending_finish:
+                self.pending_finish = False
+                self.var_progress.set(100.0)
+                self.var_status.set("完成")
+
+        # Trim the log so a long run cannot slow every redraw down.
+        try:
+            lines = int(self.txt.index("end-1c").split(".")[0])
+            if lines > LOG_CAP:
+                self.txt.configure(state="normal")
+                self.txt.delete("1.0", f"{lines - LOG_CAP}.0")
+                self.txt.configure(state="disabled")
+        except Exception:
+            pass
+
+        self.master.after(150, self._poll_queue)
 
     # ---------------- terminal states ----------------
 
