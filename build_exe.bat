@@ -19,6 +19,7 @@ echo [*] Building ...
   --collect-all av ^
   --hidden-import av ^
   --hidden-import videoshub_core ^
+  --hidden-import videoshub_player ^
   videoshub_gui.py
 
 if errorlevel 1 (

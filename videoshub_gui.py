@@ -23,6 +23,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import videoshub_core as core
+import videoshub_player as player
 
 APP_TITLE = "VideosHub 视频下载器"
 VERSION = "1.0"
@@ -53,6 +54,9 @@ class QueueProgress(core.Progress):
     def finish(self, path: str) -> None:
         self.q.put(("finish", path))
 
+    def partial(self, path: str, done: int, total: int) -> None:
+        self.q.put(("partial", (path, done, total)))
+
 
 class App(ttk.Frame):
     def __init__(self, master: tk.Tk):
@@ -80,6 +84,7 @@ class App(ttk.Frame):
         self.var_video_id = tk.StringVar()
         self.var_quality = tk.StringVar(value="1080p")
         self.var_max_seg = tk.StringVar(value="0")
+        self.var_workers = tk.StringVar(value="8")
         self.var_outdir = tk.StringVar(value=os.path.join(os.getcwd(), "videoshub_out"))
         self.var_outname = tk.StringVar(value="output")
         self.var_keep_ts = tk.BooleanVar(value=True)
@@ -87,6 +92,10 @@ class App(ttk.Frame):
         self.var_url = tk.StringVar()
         self.var_status = tk.StringVar(value="就绪")
         self.var_progress = tk.DoubleVar(value=0.0)
+        self.var_autoplay = tk.BooleanVar(value=False)
+        self.var_player = tk.StringVar(value="系统默认播放器")
+        # Path of the in-progress .ts, so the preview button knows what to open.
+        self.partial_ts: str | None = None
 
     # ---------------- layout ----------------
 
@@ -142,6 +151,16 @@ class App(ttk.Frame):
         self.ent_maxseg.grid(row=0, column=3, sticky="w", padx=(4, 16))
         ttk.Label(grid, text="0 = 全部", foreground="#888").grid(row=0, column=4, sticky="w")
 
+        # concurrency: the single biggest speed lever for long videos
+        ttk.Label(grid, text="并发连接:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.cmb_workers = ttk.Combobox(
+            grid, textvariable=self.var_workers, state="readonly", width=6,
+            values=["1", "2", "4", "8", "12", "16", "24", "32"])
+        self.cmb_workers.grid(row=1, column=1, sticky="w", padx=(4, 16), pady=(8, 0))
+        ttk.Label(grid, text="越大越快，网络差或服务端限速时调小（推荐 8）",
+                  foreground="#888").grid(row=1, column=2, columnspan=3,
+                                          sticky="w", pady=(8, 0))
+
         ttk.Label(grid, text="输出目录:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.ent_outdir = ttk.Entry(grid, textvariable=self.var_outdir)
         self.ent_outdir.grid(row=1, column=1, columnspan=3, sticky="ew",
@@ -159,6 +178,32 @@ class App(ttk.Frame):
             row=0, column=0, sticky="w", padx=(0, 16))
         ttk.Checkbutton(checks, text="转换后保留中间 .ts 文件",
                         variable=self.var_keep_ts).grid(row=0, column=1, sticky="w")
+
+        # --- playback ---------------------------------------------------
+        box_play = ttk.LabelFrame(self, text=" 播放 ", padding=8)
+        box_play.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        box_play.columnconfigure(4, weight=1)
+        row += 1
+
+        ttk.Checkbutton(box_play, text="下载完成后自动播放",
+                        variable=self.var_autoplay).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(box_play, text="播放器:").grid(row=0, column=1, sticky="w", padx=(16, 4))
+        self.players = player.find_players()
+        self.cmb_player = ttk.Combobox(
+            box_play, textvariable=self.var_player, state="readonly", width=26,
+            values=["系统默认播放器"] + [n for n, _ in self.players])
+        self.cmb_player.grid(row=0, column=2, sticky="w")
+
+        self.btn_preview = ttk.Button(box_play, text="预览已下载部分",
+                                      command=self._preview_partial, state="disabled")
+        self.btn_preview.grid(row=0, column=3, sticky="w", padx=(12, 0))
+
+        if not self.players:
+            ttk.Label(box_play,
+                      text="(未检测到 VLC / mpv / PotPlayer，将使用系统默认播放器)",
+                      foreground="#888").grid(row=1, column=0, columnspan=5,
+                                              sticky="w", pady=(4, 0))
 
         # --- actions ----------------------------------------------------
         box_act = ttk.Frame(self)
@@ -217,6 +262,33 @@ class App(ttk.Frame):
         if d:
             self.var_outdir.set(d)
 
+    def _selected_player(self) -> str | None:
+        """Map the combobox choice to an executable path, or None for default."""
+        name = self.var_player.get()
+        if name == "系统默认播放器":
+            return None
+        for n, path in self.players:
+            if n == name:
+                return path
+        return None
+
+    def _preview_partial(self):
+        """Open the .ts downloaded so far; it plays up to the current point."""
+        path = self.partial_ts
+        if not path or not os.path.exists(path):
+            messagebox.showinfo(APP_TITLE, "还没有可预览的内容,请先开始下载。")
+            return
+        size = os.path.getsize(path)
+        if size == 0:
+            messagebox.showinfo(APP_TITLE, "第一个分片还没写完,稍等片刻再试。")
+            return
+        try:
+            player.open_with(path, self._selected_player())
+            self._append_log(f"预览已下载部分 ({human_size(size)}) —— "
+                             "注意:这是正在增长的片段,只能看到已下载的部分。")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"无法启动播放器:\n{e}")
+
     def _open_outdir(self):
         d = self.var_outdir.get()
         if not os.path.isdir(d):
@@ -261,6 +333,12 @@ class App(ttk.Frame):
         if not max_seg.lstrip("-").isdigit():
             raise ValueError("最大分片数应该是整数(0 = 全部)。")
 
+        try:
+            workers = int(self.var_workers.get())
+        except ValueError:
+            workers = 8
+        workers = max(1, min(workers, 64))
+
         outdir = self.var_outdir.get().strip()
         if not outdir:
             raise ValueError("请填写输出目录。")
@@ -277,6 +355,9 @@ class App(ttk.Frame):
             out_name=outname,
             keep_ts=self.var_keep_ts.get(),
             make_mp4=self.var_make_mp4.get(),
+            auto_play=self.var_autoplay.get(),
+            player_path=self._selected_player(),
+            workers=workers,
         )
 
     def _start(self):
@@ -290,11 +371,13 @@ class App(ttk.Frame):
 
         self.cancel_event.clear()
         self.last_result = None
+        self.partial_ts = None
         self.var_progress.set(0.0)
         self.var_status.set("准备中...")
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.btn_open.configure(state="disabled")
+        self.btn_preview.configure(state="disabled")
 
         self._append_log("=" * 46)
         self._append_log("开始新任务")
@@ -343,6 +426,12 @@ class App(ttk.Frame):
                 elif kind == "finish":
                     self.var_progress.set(100.0)
                     self.var_status.set("完成")
+                elif kind == "partial":
+                    path, done, total = payload
+                    self.partial_ts = path
+                    # Only offer the preview once something is actually on disk.
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        self.btn_preview.configure(state="normal")
                 elif kind == "done":
                     self._on_done(payload)
                 elif kind == "cancelled":
@@ -359,6 +448,8 @@ class App(ttk.Frame):
     def _reset_buttons(self):
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+        # A finished run no longer has a "growing file" to preview.
+        self.btn_preview.configure(state="disabled")
 
     def _on_done(self, path):
         self._reset_buttons()
@@ -392,6 +483,7 @@ STAGE_LABELS = {
     "playlist": "拉取播放列表",
     "download": "下载分片",
     "remux": "转换为 MP4",
+    "play": "启动播放器",
 }
 
 

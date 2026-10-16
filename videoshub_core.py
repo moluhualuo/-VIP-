@@ -27,10 +27,12 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 BASE = "https://d26fh0cuir1thg.r78k4dw47n.asia"
 SECRET = "6b5hR#7uVhJPZT1zAgA26fPSyx9Zh!Za"
@@ -61,6 +63,13 @@ class Progress:
 
     def finish(self, path: str) -> None:
         """The final media file is on disk."""
+
+    def partial(self, path: str, done: int, total: int) -> None:
+        """The intermediate .ts is on disk and growing.
+
+        Emitted periodically while downloading so the UI can offer a live
+        preview. `path` is safe to open; it is simply incomplete.
+        """
 
 
 _NULL = Progress()
@@ -438,13 +447,15 @@ def parse_playlist(text):
 
 # ---------------- TS -> MP4 ----------------
 
-def remux_ts_to_mp4(ts_path: str, mp4_path: str, log=print) -> bool:
+def remux_ts_to_mp4(ts_path: str, mp4_path: str, log=print, should_stop=None) -> bool:
     """Copy the compressed streams from a .ts into an .mp4 container.
 
     Tries the ffmpeg CLI first (fast, battle-tested) and falls back to PyAV,
     which ships inside this application so no external tool is required.
     Returns True when *mp4_path* exists and is non-empty.
     """
+    stop = should_stop or (lambda: False)
+
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         log("remuxing with ffmpeg ...")
@@ -512,12 +523,17 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str, log=print) -> bool:
 
 def download_and_merge(full_url, outdir, out_name="output", max_segments=0,
                        keep_ts=True, progress: Progress = _NULL,
-                       should_stop=None, make_mp4=True):
+                       should_stop=None, make_mp4=True, workers=8):
     """Download, decrypt and concatenate the segments, then optionally remux.
+
+    `workers` controls how many segments are fetched in parallel. Bytes are
+    always written to disk in index order regardless, because a TS stream is
+    order-sensitive.
 
     Returns the path of the finished media file.
     """
     stop = should_stop or (lambda: False)
+    workers = max(1, int(workers))
 
     progress.stage("playlist")
     playlist = fetch_bytes(full_url, should_stop=stop).decode("utf-8", "replace")
@@ -535,26 +551,119 @@ def download_and_merge(full_url, outdir, out_name="output", max_segments=0,
     ts_path = os.path.join(outdir, f"{out_name}.ts")
     key_cache = {}
     written = 0
-    progress.log(f"playlist has {len(segs)} segments; downloading {total}")
+    # (index, seg_name, key_name, iv) — index drives the in-order write.
+    indexed = [(i, s[0], s[1], s[2]) for i, s in enumerate(segs[:total])]
+    progress.log(f"playlist has {len(segs)} segments; downloading {total}"
+                 + (f" with {workers} parallel connections" if workers > 1 else ""))
+
+    # Tell the UI the growing file's name up front so it can offer a preview
+    # from the very first segment.
+    progress.partial(ts_path, 0, total)
 
     progress.stage("download")
+    # Announce the growing file periodically so a preview always has fresh
+    # data. Flushing every segment also keeps the on-disk file readable by an
+    # external player while we keep writing — without the flush the buffer
+    # would hide the tail of the stream.
+    next_announce = [0]
+
+    def _maybe_announce(written_now: int):
+        if written_now >= next_announce[0]:
+            progress.partial(ts_path, written_now, total)
+            next_announce[0] = written_now + max(5, total // 20)
+
+    def _resolve(seg_name, key_name):
+        key_url = key_name if key_name.startswith(("http://", "https://")) else base + key_name
+        seg_url = seg_name if seg_name.startswith(("http://", "https://")) else base + seg_name
+        return key_url, seg_url
+
+    def fetch_one(item):
+        """Worker: fetch + decrypt a single segment. Pure network work, no disk."""
+        idx, seg_name, key_name, iv = item
+        if stop():
+            raise DownloadCancelled()
+        key_url, seg_url = _resolve(seg_name, key_name)
+        with key_lock:
+            cached = key_cache.get(key_url)
+        if cached is None:
+            cached = fetch_bytes(key_url, referer=full_url, should_stop=stop)
+            with key_lock:
+                key_cache[key_url] = cached
+        key = cached
+        enc = fetch_bytes(seg_url, referer=full_url, should_stop=stop)
+        if len(key) != 16:
+            raise RuntimeError(f"AES-128 key at {key_url} is {len(key)} bytes, expected 16")
+        dec = aes128_cbc_decrypt(key, iv, enc)
+        return idx, seg_url.rsplit("/", 1)[-1], len(enc), len(dec), dec
+
+    key_lock = threading.Lock()
+
     with open(ts_path, "wb") as out:
-        for idx, (seg_name, key_name, iv) in enumerate(segs[:total]):
-            if stop():
+        if workers <= 1:
+            # Serial path: nothing to reorder, write straight through.
+            for item in indexed:
+                _, seg_url, enc_n, dec_n, dec = fetch_one(item)
+                out.write(dec)
+                out.flush()
+                written += 1
+                progress.segment(written, total, seg_url, enc_n, dec_n)
+                _maybe_announce(written)
+        else:
+            # Concurrent path: N fetchers in flight, but TS is a stream so
+            # bytes MUST hit the file in index order. We keep a small window
+            # of finished results and emit them strictly in sequence.
+            window = max(workers * 2, 8)
+            pending: dict[int, tuple] = {}
+            done_idx = 0          # next index to write
+            submitted = 0         # next index to schedule
+            cancelled = False
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures: dict = {}
+
+                def submit_upto(limit: int):
+                    nonlocal submitted
+                    while submitted < limit and submitted < len(indexed):
+                        futures[pool.submit(fetch_one, indexed[submitted])] = submitted
+                        submitted += 1
+
+                submit_upto(window)
+                try:
+                    while done_idx < len(indexed):
+                        if stop():
+                            cancelled = True
+                            break
+                        # Wait for whichever future finishes next.
+                        done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            idx = futures.pop(fut)
+                            try:
+                                result = fut.result()
+                            except DownloadCancelled:
+                                cancelled = True
+                                continue
+                            pending[result[0]] = result
+
+                        # Drain in order; stop at the first gap.
+                        while done_idx in pending:
+                            _, name, enc_n, dec_n, dec = pending.pop(done_idx)
+                            out.write(dec)
+                            out.flush()
+                            written += 1
+                            progress.segment(written, total, name, enc_n, dec_n)
+                            _maybe_announce(written)
+                            done_idx += 1
+
+                        if cancelled:
+                            break
+                        # Keep the pipeline full.
+                        submit_upto(len(indexed))
+                finally:
+                    for fut in futures:
+                        fut.cancel()
+
+            if cancelled:
                 raise DownloadCancelled()
-            key_url = key_name if key_name.startswith(("http://", "https://")) else base + key_name
-            seg_url = seg_name if seg_name.startswith(("http://", "https://")) else base + seg_name
-            if key_url not in key_cache:
-                key_cache[key_url] = fetch_bytes(key_url, referer=full_url, should_stop=stop)
-            key = key_cache[key_url]
-            enc = fetch_bytes(seg_url, referer=full_url, should_stop=stop)
-            if len(key) != 16:
-                raise RuntimeError(f"AES-128 key at {key_url} is {len(key)} bytes, expected 16")
-            dec = aes128_cbc_decrypt(key, iv, enc)
-            out.write(dec)
-            written += 1
-            progress.segment(idx + 1, total, seg_url.rsplit("/", 1)[-1],
-                             len(enc), len(dec))
 
     ts_size = os.path.getsize(ts_path)
     progress.log(f"wrote {written} segments, {ts_size} bytes -> {ts_path}")
@@ -565,7 +674,7 @@ def download_and_merge(full_url, outdir, out_name="output", max_segments=0,
 
     mp4_path = os.path.join(outdir, f"{out_name}.mp4")
     progress.stage("remux")
-    ok = remux_ts_to_mp4(ts_path, mp4_path, log=progress.log)
+    ok = remux_ts_to_mp4(ts_path, mp4_path, log=progress.log, should_stop=stop)
     if not ok:
         progress.log("remux unavailable; the concatenated .ts is left in place "
                      "(it plays as-is in most players)")
@@ -578,6 +687,8 @@ def download_and_merge(full_url, outdir, out_name="output", max_segments=0,
             progress.log("removed the intermediate .ts")
         except OSError:
             pass
+    if os.path.exists(mp4_path):
+        progress.log("saved a full-length preview you can play immediately")
     progress.finish(mp4_path)
     return mp4_path
 
@@ -599,8 +710,13 @@ def resolve_playlist_url(url, quality, progress: Progress = _NULL):
 
 def run(url=None, video_id=None, quality="1080p", max_segments=0,
         outdir="./videoshub_out", out_name="output", keep_ts=True,
-        make_mp4=True, progress: Progress = _NULL, should_stop=None):
-    """The single entry point the UI calls. Returns the finished file's path."""
+        make_mp4=True, progress: Progress = _NULL, should_stop=None,
+        auto_play=False, player_path=None, workers=8):
+    """The single entry point the UI calls. Returns the finished file's path.
+
+    With auto_play set, the finished file is opened in `player_path` (or the
+    OS default player when that is None) before returning.
+    """
     stop = should_stop or (lambda: False)
 
     if url:
@@ -631,6 +747,17 @@ def run(url=None, video_id=None, quality="1080p", max_segments=0,
         progress.log(f"video id = {vid}")
 
     progress.log(f"playlist URL = {full_url}")
-    return download_and_merge(full_url, outdir, out_name, max_segments,
-                              keep_ts=keep_ts, progress=progress,
-                              should_stop=stop, make_mp4=make_mp4)
+    final = download_and_merge(full_url, outdir, out_name, max_segments,
+                               keep_ts=keep_ts, progress=progress,
+                               should_stop=stop, make_mp4=make_mp4,
+                               workers=workers)
+
+    if auto_play and final:
+        progress.stage("play")
+        progress.log(f"opening the player for {final}")
+        try:
+            import videoshub_player as player
+            player.open_with(final, player_path)
+        except Exception as e:
+            progress.log(f"could not launch the player: {e}")
+    return final
