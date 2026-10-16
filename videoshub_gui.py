@@ -26,7 +26,24 @@ import videoshub_core as core
 import videoshub_player as player
 
 APP_TITLE = "VideosHub 视频下载器"
-VERSION = "1.0"
+VERSION = "1.1"
+
+# ---------------- look & feel ----------------
+# One small palette, used everywhere, so the window reads as a single piece
+# instead of a pile of default-grey widgets. Change it here to retheme.
+BG        = "#f4f5f7"   # window background
+CARD      = "#ffffff"   # section surface
+BORDER    = "#e4e7ec"   # hairline around cards
+TEXT      = "#1f2328"   # primary text
+MUTED     = "#6b7280"   # hints / secondary text
+ACCENT    = "#2f6feb"   # primary action
+ACCENT_HI = "#1f5bd6"   # primary action, hover
+ACCENT_OFF = "#aebfe4"  # primary action, disabled
+SUCCESS   = "#16a34a"
+LOG_BG    = "#0f1419"   # console panel
+LOG_FG    = "#c9d1d9"
+FONT      = "Microsoft YaHei UI"   # renders CJK cleanly on Windows
+FONT_MONO = "Consolas"
 
 
 def _resource_dir() -> str:
@@ -34,6 +51,75 @@ def _resource_dir() -> str:
     if getattr(sys, "frozen", False):
         return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _label(parent, text, muted=False, bold=False, bg=CARD, **kw):
+    """A themed tk.Label. tk (not ttk) so the colour is actually honoured."""
+    font = (FONT, 9, "bold") if bold else (FONT, 9)
+    return tk.Label(parent, text=text, bg=bg, fg=MUTED if muted else TEXT,
+                    font=font, **kw)
+
+
+def _primary_button(parent, text, command):
+    """A flat, coloured call-to-action button."""
+    return tk.Button(parent, text=text, command=command,
+                     bg=ACCENT, fg="#ffffff",
+                     activebackground=ACCENT_HI, activeforeground="#ffffff",
+                     disabledforeground="#e8eefc",
+                     relief="flat", bd=0, padx=24, pady=8,
+                     font=(FONT, 10, "bold"), cursor="hand2")
+
+
+def _set_enabled(btn, on: bool, primary=False):
+    """Enable/disable a button, keeping the primary button's colour coherent."""
+    btn.configure(state="normal" if on else "disabled")
+    if primary:
+        btn.configure(bg=ACCENT if on else ACCENT_OFF)
+
+
+def _setup_style(root):
+    """Configure ttk so its widgets match the palette.
+
+    The default Windows themes ignore most colour options, so we switch to
+    'clam', which honours them.
+    """
+    st = ttk.Style(root)
+    try:
+        st.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    st.configure(".", background=CARD, foreground=TEXT, font=(FONT, 9))
+    for name in ("TFrame", "TLabel"):
+        st.configure(name, background=CARD, foreground=TEXT)
+    for name in ("TRadiobutton", "TCheckbutton"):
+        st.configure(name, background=CARD, foreground=TEXT, focuscolor=CARD)
+        st.map(name, background=[("active", CARD)])
+
+    st.configure("TEntry", fieldbackground="#ffffff", bordercolor=BORDER,
+                 lightcolor=BORDER, darkcolor=BORDER, padding=5)
+    st.map("TEntry", bordercolor=[("focus", ACCENT)],
+           lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
+
+    st.configure("TCombobox", fieldbackground="#ffffff", background="#ffffff",
+                 bordercolor=BORDER, arrowcolor=MUTED, padding=4)
+    st.map("TCombobox",
+           fieldbackground=[("readonly", "#ffffff"), ("disabled", "#f2f3f5")],
+           foreground=[("disabled", MUTED)],
+           bordercolor=[("focus", ACCENT)])
+
+    st.configure("TButton", padding=(12, 6), font=(FONT, 9),
+                 background="#eef0f3", bordercolor=BORDER, focuscolor=CARD)
+    st.map("TButton",
+           background=[("active", "#e2e5ea"), ("disabled", "#f6f7f9")],
+           foreground=[("disabled", "#a9b0ba")])
+
+    st.configure("Accent.Horizontal.TProgressbar",
+                 troughcolor="#e6e9ef", background=ACCENT,
+                 bordercolor="#e6e9ef", lightcolor=ACCENT, darkcolor=ACCENT,
+                 thickness=8)
+    st.configure("Vertical.TScrollbar", background="#cbd2dc",
+                 troughcolor=LOG_BG, bordercolor=LOG_BG, arrowcolor="#8b98a8")
 
 
 class QueueProgress(core.Progress):
@@ -68,9 +154,10 @@ class QueueProgress(core.Progress):
         self.q.put(("partial", (path, done, total)))
 
 
-class App(ttk.Frame):
+class App(tk.Frame):
     def __init__(self, master: tk.Tk):
-        super().__init__(master, padding=10)
+        # tk.Frame (not ttk) so the window background colour is honoured.
+        super().__init__(master, bg=BG, padx=16, pady=16)
         self.master = master
         self.grid(sticky="nsew")
         master.columnconfigure(0, weight=1)
@@ -112,154 +199,206 @@ class App(ttk.Frame):
 
     # ---------------- layout ----------------
 
+    def _card(self, row, title, expand=False):
+        """A white panel with a hairline border and a small section title.
+
+        Returns the inner frame to put content in.
+        """
+        outer = tk.Frame(self, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1)
+        outer.grid(row=row, column=0, sticky="nsew" if expand else "ew",
+                   pady=(0, 10))
+        outer.columnconfigure(0, weight=1)
+        _label(outer, title, muted=True, bold=True).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(8, 0))
+        body = tk.Frame(outer, bg=CARD)
+        body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(6, 10))
+        body.columnconfigure(0, weight=1)
+        if expand:
+            outer.rowconfigure(1, weight=1)
+            body.rowconfigure(0, weight=1)
+        return body
+
     def _build_widgets(self):
-        row = 0
+        # ---- header ----------------------------------------------------
+        header = tk.Frame(self, bg=CARD, highlightbackground=BORDER,
+                          highlightthickness=1)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        tk.Label(header, text=APP_TITLE, bg=CARD, fg=TEXT,
+                 font=(FONT, 14, "bold")).grid(row=0, column=0, sticky="w",
+                                               padx=14, pady=(10, 0))
+        _label(header, "HLS 并发下载 · AES-128 解密 · 自动转 MP4",
+               muted=True).grid(row=1, column=0, sticky="w",
+                                padx=14, pady=(1, 9))
+        _label(header, f"v{VERSION}", muted=True).grid(
+            row=0, column=1, rowspan=2, sticky="e", padx=14)
+        row = 1
 
-        # --- mode -------------------------------------------------------
-        box_mode = ttk.LabelFrame(self, text=" 下载方式 ", padding=8)
-        box_mode.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        box_mode.columnconfigure(1, weight=1)
-        row += 1
+        # ---- download mode ---------------------------------------------
+        body = self._card(row, "下载方式"); row += 1
 
-        ttk.Radiobutton(box_mode, text="随机视频", value="random",
-                        variable=self.var_mode,
-                        command=self._sync_mode).grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ttk.Radiobutton(box_mode, text="指定视频 ID", value="id",
-                        variable=self.var_mode,
-                        command=self._sync_mode).grid(row=0, column=1, sticky="w", padx=(0, 12))
-        ttk.Radiobutton(box_mode, text="直接输入 URL", value="url",
-                        variable=self.var_mode,
-                        command=self._sync_mode).grid(row=0, column=2, sticky="w")
+        modes = tk.Frame(body, bg=CARD)
+        modes.grid(row=0, column=0, sticky="w")
+        for i, (txt, val) in enumerate((("随机视频", "random"),
+                                        ("指定视频 ID", "id"),
+                                        ("直接输入 URL", "url"))):
+            ttk.Radiobutton(modes, text=txt, value=val,
+                            variable=self.var_mode,
+                            command=self._sync_mode).grid(row=0, column=i,
+                                                          padx=(0, 20))
 
-        self.ent_video_id = ttk.Entry(box_mode, textvariable=self.var_video_id, width=24)
-        self.ent_video_id.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(box_mode, text="例如 32238", foreground="#888").grid(
-            row=1, column=2, sticky="w", padx=(6, 0))
+        # Each input lives in its own frame so _sync_mode can show only the one
+        # the current mode needs — keeps this card (and the window) short.
+        self.row_id = tk.Frame(body, bg=CARD)
+        self.row_id.columnconfigure(0, weight=1)
+        self.ent_video_id = ttk.Entry(self.row_id, textvariable=self.var_video_id,
+                                      font=(FONT, 10))
+        self.ent_video_id.grid(row=0, column=0, sticky="ew")
+        _label(self.row_id, "例如 32238", muted=True).grid(row=0, column=1,
+                                                           padx=(10, 0))
 
-        self.ent_url = ttk.Entry(box_mode, textvariable=self.var_url)
-        self.ent_url.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Label(box_mode,
-                  text="支持 .m3u8 完整播放列表(免登录直下)或含 /p2/preview/ 的预览地址(自动签名)",
-                  foreground="#888").grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self.row_url = tk.Frame(body, bg=CARD)
+        self.row_url.columnconfigure(0, weight=1)
+        self.ent_url = ttk.Entry(self.row_url, textvariable=self.var_url,
+                                 font=(FONT, 10))
+        self.ent_url.grid(row=0, column=0, sticky="ew")
 
-        # --- options ----------------------------------------------------
-        box_opt = ttk.LabelFrame(self, text=" 参数 ", padding=8)
-        box_opt.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        box_opt.columnconfigure(0, weight=1)
-        row += 1
+        self.lbl_url_hint = _label(
+            body, "支持 .m3u8 完整播放列表（免登录直下），"
+                  "或含 /p2/preview/ 的预览地址（自动签名）", muted=True)
 
-        grid = ttk.Frame(box_opt)
-        grid.grid(row=0, column=0, sticky="ew")
-        grid.columnconfigure(1, weight=1)
-        grid.columnconfigure(4, weight=1)
+        # ---- parameters -------------------------------------------------
+        body = self._card(row, "参数"); row += 1
+        g = tk.Frame(body, bg=CARD)
+        g.grid(row=0, column=0, sticky="ew")
+        g.columnconfigure(1, weight=1)
+        g.columnconfigure(4, weight=1)
 
-        ttk.Label(grid, text="清晰度:").grid(row=0, column=0, sticky="w")
-        self.cmb_quality = ttk.Combobox(grid, textvariable=self.var_quality,
+        _label(g, "清晰度").grid(row=0, column=0, sticky="w", pady=3)
+        self.cmb_quality = ttk.Combobox(g, textvariable=self.var_quality,
                                         values=["480p", "720p", "1080p"],
-                                        state="readonly", width=10)
-        self.cmb_quality.grid(row=0, column=1, sticky="w", padx=(4, 16))
+                                        state="readonly", width=10,
+                                        font=(FONT, 10))
+        self.cmb_quality.grid(row=0, column=1, sticky="w", padx=(8, 24), pady=3)
 
-        ttk.Label(grid, text="最大分片数:").grid(row=0, column=2, sticky="w")
-        self.ent_maxseg = ttk.Entry(grid, textvariable=self.var_max_seg, width=10)
-        self.ent_maxseg.grid(row=0, column=3, sticky="w", padx=(4, 16))
-        ttk.Label(grid, text="0 = 全部", foreground="#888").grid(row=0, column=4, sticky="w")
+        _label(g, "最大分片数").grid(row=0, column=2, sticky="w", pady=3)
+        self.ent_maxseg = ttk.Entry(g, textvariable=self.var_max_seg,
+                                    width=10, font=(FONT, 10))
+        self.ent_maxseg.grid(row=0, column=3, sticky="w", padx=(8, 8), pady=3)
+        _label(g, "0 = 全部", muted=True).grid(row=0, column=4, sticky="w",
+                                              pady=3)
 
-        # concurrency: the single biggest speed lever for long videos
-        ttk.Label(grid, text="并发连接:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        _label(g, "并发连接").grid(row=1, column=0, sticky="w", pady=3)
         self.cmb_workers = ttk.Combobox(
-            grid, textvariable=self.var_workers, state="readonly", width=6,
-            values=["1", "2", "4", "8", "12", "16", "24", "32"])
-        self.cmb_workers.grid(row=1, column=1, sticky="w", padx=(4, 16), pady=(8, 0))
-        ttk.Label(grid, text="越大越快，网络差或服务端限速时调小（推荐 8）",
-                  foreground="#888").grid(row=1, column=2, columnspan=3,
-                                          sticky="w", pady=(8, 0))
+            g, textvariable=self.var_workers, state="readonly", width=6,
+            values=["1", "2", "4", "8", "12", "16", "24", "32"],
+            font=(FONT, 10))
+        self.cmb_workers.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=3)
+        _label(g, "越大越快；网络差或服务端限速时调小（推荐 8）",
+               muted=True).grid(row=1, column=2, columnspan=3, sticky="w",
+                                pady=3)
 
-        ttk.Label(grid, text="输出目录:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.ent_outdir = ttk.Entry(grid, textvariable=self.var_outdir)
-        self.ent_outdir.grid(row=1, column=1, columnspan=3, sticky="ew",
-                             padx=(4, 4), pady=(8, 0))
-        ttk.Button(grid, text="浏览...", width=8,
-                   command=self._choose_dir).grid(row=1, column=4, sticky="e", pady=(8, 0))
+        _label(g, "输出目录").grid(row=2, column=0, sticky="w", pady=3)
+        self.ent_outdir = ttk.Entry(g, textvariable=self.var_outdir,
+                                    font=(FONT, 10))
+        self.ent_outdir.grid(row=2, column=1, columnspan=3, sticky="ew",
+                             padx=(8, 8), pady=3)
+        ttk.Button(g, text="浏览…", width=8, command=self._choose_dir).grid(
+            row=2, column=4, sticky="w", pady=3)
 
-        ttk.Label(grid, text="文件名:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(grid, textvariable=self.var_outname, width=24).grid(
-            row=2, column=1, sticky="w", padx=(4, 16), pady=(8, 0))
-
-        checks = ttk.Frame(grid)
-        checks.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(checks, text="自动转成 MP4", variable=self.var_make_mp4).grid(
-            row=0, column=0, sticky="w", padx=(0, 16))
+        # Filename and the two toggles share a row to keep the card short.
+        _label(g, "文件名").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Entry(g, textvariable=self.var_outname, width=20,
+                  font=(FONT, 10)).grid(row=3, column=1, sticky="w",
+                                        padx=(8, 24), pady=3)
+        checks = tk.Frame(g, bg=CARD)
+        checks.grid(row=3, column=2, columnspan=3, sticky="w", pady=3)
+        ttk.Checkbutton(checks, text="自动转成 MP4",
+                        variable=self.var_make_mp4).grid(row=0, column=0,
+                                                         padx=(0, 18))
         ttk.Checkbutton(checks, text="转换后保留中间 .ts 文件",
-                        variable=self.var_keep_ts).grid(row=0, column=1, sticky="w")
+                        variable=self.var_keep_ts).grid(row=0, column=1)
 
-        # --- playback ---------------------------------------------------
-        box_play = ttk.LabelFrame(self, text=" 播放 ", padding=8)
-        box_play.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        box_play.columnconfigure(4, weight=1)
-        row += 1
-
-        ttk.Checkbutton(box_play, text="下载完成后自动播放",
-                        variable=self.var_autoplay).grid(row=0, column=0, sticky="w")
-
-        ttk.Label(box_play, text="播放器:").grid(row=0, column=1, sticky="w", padx=(16, 4))
+        # ---- playback ---------------------------------------------------
+        body = self._card(row, "播放"); row += 1
+        prow = tk.Frame(body, bg=CARD)
+        prow.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(prow, text="下载完成后自动播放",
+                        variable=self.var_autoplay).grid(row=0, column=0,
+                                                         sticky="w")
+        _label(prow, "播放器").grid(row=0, column=1, padx=(20, 6))
         self.players = player.find_players()
         self.cmb_player = ttk.Combobox(
-            box_play, textvariable=self.var_player, state="readonly", width=26,
+            prow, textvariable=self.var_player, state="readonly", width=24,
+            font=(FONT, 10),
             values=["系统默认播放器"] + [n for n, _ in self.players])
         self.cmb_player.grid(row=0, column=2, sticky="w")
-
-        self.btn_preview = ttk.Button(box_play, text="预览已下载部分",
-                                      command=self._preview_partial, state="disabled")
-        self.btn_preview.grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self.btn_preview = ttk.Button(prow, text="预览已下载部分",
+                                      command=self._preview_partial,
+                                      state="disabled")
+        self.btn_preview.grid(row=0, column=3, padx=(16, 0))
 
         if not self.players:
-            ttk.Label(box_play,
-                      text="(未检测到 VLC / mpv / PotPlayer，将使用系统默认播放器)",
-                      foreground="#888").grid(row=1, column=0, columnspan=5,
-                                              sticky="w", pady=(4, 0))
+            # Inline rather than on its own row, to keep the card one line tall.
+            _label(prow, "未检测到播放器，将用系统默认", muted=True).grid(
+                row=0, column=4, padx=(14, 0))
 
-        # --- actions ----------------------------------------------------
-        box_act = ttk.Frame(self)
-        box_act.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        box_act.columnconfigure(2, weight=1)
-        row += 1
+        # ---- actions + progress -----------------------------------------
+        body = self._card(row, "操作"); row += 1
 
-        self.btn_start = ttk.Button(box_act, text="开始下载", command=self._start)
-        self.btn_start.grid(row=0, column=0, padx=(0, 6))
-        self.btn_stop = ttk.Button(box_act, text="停止", command=self._stop, state="disabled")
-        self.btn_stop.grid(row=0, column=1, padx=(0, 6))
-        self.btn_open = ttk.Button(box_act, text="打开输出目录",
+        act = tk.Frame(body, bg=CARD)
+        act.grid(row=0, column=0, sticky="ew")
+        act.columnconfigure(2, weight=1)
+        self.btn_start = _primary_button(act, "开始下载", self._start)
+        self.btn_start.grid(row=0, column=0, padx=(0, 8))
+        self.btn_stop = ttk.Button(act, text="停止", width=10,
+                                   command=self._stop, state="disabled")
+        self.btn_stop.grid(row=0, column=1)
+        self.btn_open = ttk.Button(act, text="打开输出目录",
                                    command=self._open_outdir, state="disabled")
         self.btn_open.grid(row=0, column=3, sticky="e")
 
-        # --- progress ---------------------------------------------------
-        box_prog = ttk.Frame(self)
-        box_prog.grid(row=row, column=0, sticky="ew")
-        box_prog.columnconfigure(0, weight=1)
-        row += 1
-
-        self.pb = ttk.Progressbar(box_prog, variable=self.var_progress,
-                                  maximum=100.0, mode="determinate")
+        prog = tk.Frame(body, bg=CARD)
+        prog.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        prog.columnconfigure(0, weight=1)
+        self.pb = ttk.Progressbar(prog, variable=self.var_progress,
+                                  maximum=100.0, mode="determinate",
+                                  style="Accent.Horizontal.TProgressbar")
         self.pb.grid(row=0, column=0, sticky="ew")
-        ttk.Label(box_prog, textvariable=self.var_status).grid(
-            row=1, column=0, sticky="w", pady=(2, 6))
+        self.lbl_pct = tk.Label(prog, text="0%", bg=CARD, fg=ACCENT,
+                                font=(FONT, 10, "bold"), width=5, anchor="e")
+        self.lbl_pct.grid(row=0, column=1, padx=(10, 0))
+        self.lbl_status = _label(prog, "", muted=True, anchor="w")
+        self.lbl_status.configure(textvariable=self.var_status)
+        self.lbl_status.grid(row=1, column=0, columnspan=2, sticky="ew",
+                             pady=(6, 0))
 
-        # --- log --------------------------------------------------------
-        box_log = ttk.LabelFrame(self, text=" 日志 ", padding=4)
-        box_log.grid(row=row, column=0, sticky="nsew", pady=(8, 0))
-        box_log.columnconfigure(0, weight=1)
-        box_log.rowconfigure(0, weight=1)
+        # ---- log ---------------------------------------------------------
+        logcard = tk.Frame(self, bg=CARD, highlightbackground=BORDER,
+                           highlightthickness=1)
+        logcard.grid(row=row, column=0, sticky="nsew", pady=(0, 0))
+        logcard.columnconfigure(0, weight=1)
+        logcard.rowconfigure(1, weight=1)
         self.rowconfigure(row, weight=1)
         row += 1
 
-        self.txt = tk.Text(box_log, height=14, wrap="none", state="normal",
-                           background="#1e1e1e", foreground="#d4d4d4",
-                           insertbackground="#d4d4d4", relief="flat",
-                           font=("Consolas", 9))
+        _label(logcard, "日志", muted=True, bold=True).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(9, 0))
+        wrap = tk.Frame(logcard, bg=LOG_BG)
+        wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=(7, 12))
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+
+        self.txt = tk.Text(wrap, height=9, wrap="none", state="normal",
+                           background=LOG_BG, foreground=LOG_FG,
+                           insertbackground=LOG_FG, relief="flat", bd=0,
+                           font=(FONT_MONO, 9), padx=10, pady=8,
+                           selectbackground="#264f78")
         self.txt.grid(row=0, column=0, sticky="nsew")
         # Read-only in effect: block typing/editing but avoid state toggling.
         self.txt.bind("<Key>", lambda e: "break")
-        vs = ttk.Scrollbar(box_log, orient="vertical", command=self.txt.yview)
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.txt.yview)
         vs.grid(row=0, column=1, sticky="ns")
         self.txt.configure(yscrollcommand=vs.set)
 
@@ -268,9 +407,21 @@ class App(ttk.Frame):
     # ---------------- mode switching ----------------
 
     def _sync_mode(self):
+        """Enable, and show, only the input the selected mode actually uses."""
         mode = self.var_mode.get()
-        self.ent_video_id.configure(state="normal" if mode == "id" else "disabled")
-        self.ent_url.configure(state="normal" if mode == "url" else "disabled")
+
+        # Clear every optional row first, then re-grid the one we need. This
+        # keeps the card from reserving space for hidden fields.
+        for w in (self.row_id, self.row_url, self.lbl_url_hint):
+            w.grid_remove()
+
+        if mode == "id":
+            self.row_id.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+            self.ent_video_id.configure(state="normal")
+        elif mode == "url":
+            self.row_url.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+            self.lbl_url_hint.grid(row=2, column=0, sticky="w", pady=(5, 0))
+            self.ent_url.configure(state="normal")
 
     def _choose_dir(self):
         d = filedialog.askdirectory(initialdir=self.var_outdir.get() or os.getcwd())
@@ -405,7 +556,7 @@ class App(ttk.Frame):
         self.pending_finish = False
         self.var_progress.set(0.0)
         self.var_status.set("准备中...")
-        self.btn_start.configure(state="disabled")
+        _set_enabled(self.btn_start, False, primary=True)
         self.btn_stop.configure(state="normal")
         self.btn_open.configure(state="disabled")
         self.btn_preview.configure(state="disabled")
@@ -501,6 +652,12 @@ class App(ttk.Frame):
                 self.var_progress.set(100.0)
                 self.var_status.set("完成")
 
+            # Keep the percentage readout in step with the bar.
+            try:
+                self.lbl_pct.configure(text=f"{int(self.var_progress.get())}%")
+            except Exception:
+                pass
+
         # Trim the log so a long run cannot slow every redraw down.
         # (Handled incrementally in _append_log; nothing to do per tick.)
 
@@ -509,7 +666,7 @@ class App(ttk.Frame):
     # ---------------- terminal states ----------------
 
     def _reset_buttons(self):
-        self.btn_start.configure(state="normal")
+        _set_enabled(self.btn_start, True, primary=True)
         self.btn_stop.configure(state="disabled")
         # A finished run no longer has a "growing file" to preview.
         self.btn_preview.configure(state="disabled")
@@ -586,12 +743,10 @@ def main():
 
     root = tk.Tk()
     root.title(f"{APP_TITLE} v{VERSION}")
-    root.geometry("760x680")
-    root.minsize(660, 580)
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        pass
+    root.configure(bg=BG)
+    _setup_style(root)
+    root.geometry("840x900")
+    root.minsize(760, 640)
     App(root)
     root.mainloop()
 
@@ -611,12 +766,14 @@ def _selftest():
     report = os.path.join(base, "_selftest_report.txt")
 
     root = tk.Tk()
+    root.configure(bg=BG)
+    _setup_style(root)
     # Visible window: repaint cost only shows up when Tk actually has to
     # redraw. Withdrawing the window would hide the very problem we measure.
     if "--hidden" in sys.argv:
         root.withdraw()
     else:
-        root.geometry("760x680")
+        root.geometry("840x900")
         root.deiconify()
     app = App(root)
     app.var_mode.set("random")
