@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- PyInstaller ----
+build/
+*.manifest
+
+# ---- 下载产物(大文件,不入库) ----
+videoshub_out/
+*.ts
+*.mp4
+
+# ---- 打包存档 ----
+*.7z
+*.zip
+*.rar
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
